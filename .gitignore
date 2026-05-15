@@ -1,0 +1,11 @@
+/build_runner.zig
+/.zig-cache
+zig-out
+.zigmod
+deps.zig
+core.*
+/qemu*.core
+/fuzz/outputs
+
+# OS junk
+.DS_Store
