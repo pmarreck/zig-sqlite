@@ -1023,7 +1023,9 @@ const TestVirtualTable = struct {
             //
 
             const data = &[_][]const u8{
-                "Vincent", "José", "Michel",
+                "Vincent",
+                "José",
+                "Michel",
             };
 
             var rand = std.Random.DefaultPrng.init(204882485);
