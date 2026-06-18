@@ -35,8 +35,14 @@ pub fn ParsedQuery(comptime tmp_query: []const u8) type {
 
         pub const bind_markers = result.bind_markers[0..result.bind_markers_len];
 
+        /// The final SQL query, materialized as a top-level comptime decl so it
+        /// is reliably lowered to runtime read-only data. Returning a slice into
+        /// a by-value `result` struct field yielded corrupted bytes under Zig
+        /// 0.16's comptime memory lowering in deeply-nested generic instantiations.
+        pub const query_str: [result.query_len]u8 = result.query[0..result.query_len].*;
+
         pub fn getQuery() []const u8 {
-            return Self.result.query[0..Self.result.query_len];
+            return &Self.query_str;
         }
 
         const ParsedQueryResult = struct {
@@ -275,6 +281,16 @@ test "parsed query: query" {
         const parsed_query = ParsedQuery(tc.query);
         try testing.expectEqualStrings(tc.expected_query, parsed_query.getQuery());
     }
+}
+
+// TDD: getQuery() must return correct bytes at RUNTIME (not just comptime).
+// Reproduces the 0.16.0 EmptyQuery failure where runtime getQuery yielded spaces.
+test "parsed query: getQuery at runtime" {
+    @setEvalBranchQuota(100000);
+    const PQ = ParsedQuery("SELECT max(c) FROM b");
+    var runtime_q: []const u8 = undefined;
+    runtime_q = PQ.getQuery();
+    try testing.expectEqualStrings("SELECT max(c) FROM b", runtime_q);
 }
 
 test "parsed query: bind markers types" {

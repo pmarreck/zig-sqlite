@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const debug = std.debug;
 const heap = std.heap;
-const io = std.io;
 const mem = std.mem;
 const testing = std.testing;
 
@@ -82,7 +81,7 @@ pub const Text = struct { data: []const u8 };
 ///    var blob = try db.openBlob(.main, "user", "data", row_id, .{ .write = true });
 ///
 ///    var blob_writer = blob.writer();
-///    try blob_writer.writeAll("foobar");
+///    try blob_writer.interface.writeAll("foobar");
 ///
 ///    try blob.close();
 ///
@@ -132,59 +131,100 @@ pub const Blob = struct {
         }
     }
 
-    pub const Reader = io.GenericReader(*Self, errors.Error, read);
+    /// BlobReader adapts a Blob to the std.Io.Reader interface for incremental reads.
+    /// Use the `interface` field with std.Io.Reader methods (e.g. `allocRemaining`).
+    pub const BlobReader = struct {
+        blob: *Self,
+        interface: std.Io.Reader,
 
-    /// reader returns a io.Reader.
-    pub fn reader(self: *Self) Reader {
-        return .{ .context = self };
-    }
+        /// stream reads blob bytes into the destination writer, returning EndOfStream at the end.
+        /// Implements the std.Io.Reader vtable `stream` contract for SQLite incremental blob i/o.
+        fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const br: *BlobReader = @fieldParentPtr("interface", r);
+            const self = br.blob;
 
-    fn read(self: *Self, buffer: []u8) Error!usize {
-        if (self.offset >= self.size) {
-            return 0;
-        }
+            if (self.offset >= self.size) return error.EndOfStream;
 
-        const tmp_buffer = blk: {
             const remaining: usize = @as(usize, @intCast(self.size)) - @as(usize, @intCast(self.offset));
-            break :blk if (buffer.len > remaining) buffer[0..remaining] else buffer;
+            const want = limit.minInt(remaining);
+            if (want == 0) return error.EndOfStream;
+
+            const dest = try w.writableSliceGreedy(1);
+            const n = @min(dest.len, want);
+
+            const result = c.sqlite3_blob_read(self.handle, dest.ptr, @intCast(n), self.offset);
+            if (result != c.SQLITE_OK) return error.ReadFailed;
+
+            w.advance(n);
+            self.offset += @intCast(n);
+            return n;
+        }
+    };
+
+    /// reader returns a BlobReader exposing a std.Io.Reader via its `interface` field.
+    pub fn reader(self: *Self) BlobReader {
+        return .{
+            .blob = self,
+            .interface = .{
+                .vtable = &.{ .stream = BlobReader.stream },
+                .buffer = &.{},
+                .seek = 0,
+                .end = 0,
+            },
         };
-
-        const result = c.sqlite3_blob_read(
-            self.handle,
-            tmp_buffer.ptr,
-            @intCast(tmp_buffer.len),
-            self.offset,
-        );
-        if (result != c.SQLITE_OK) {
-            return errors.errorFromResultCode(result);
-        }
-
-        self.offset += @intCast(tmp_buffer.len);
-
-        return tmp_buffer.len;
     }
 
-    pub const Writer = io.GenericWriter(*Self, Error, write);
+    /// BlobWriter adapts a Blob to the std.Io.Writer interface for incremental writes.
+    /// Use the `interface` field with std.Io.Writer methods (e.g. `writeAll`).
+    pub const BlobWriter = struct {
+        blob: *Self,
+        interface: std.Io.Writer,
 
-    /// writer returns a io.Writer.
-    pub fn writer(self: *Self) Writer {
-        return .{ .context = self };
-    }
+        /// drain writes buffered and data bytes to the blob via sqlite3_blob_write.
+        /// Implements the std.Io.Writer vtable `drain` contract for SQLite incremental blob i/o.
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const bw: *BlobWriter = @fieldParentPtr("interface", w);
+            const self = bw.blob;
 
-    fn write(self: *Self, data: []const u8) Error!usize {
-        const result = c.sqlite3_blob_write(
-            self.handle,
-            data.ptr,
-            @intCast(data.len),
-            self.offset,
-        );
-        if (result != c.SQLITE_OK) {
-            return errors.errorFromResultCode(result);
+            // Flush any bytes buffered in the writer first.
+            if (w.end > 0) {
+                try blobWrite(self, w.buffer[0..w.end]);
+                w.end = 0;
+            }
+
+            var written: usize = 0;
+            const slices = data[0 .. data.len - 1];
+            for (slices) |bytes| {
+                try blobWrite(self, bytes);
+                written += bytes.len;
+            }
+            const pattern = data[data.len - 1];
+            var i: usize = 0;
+            while (i < splat) : (i += 1) {
+                try blobWrite(self, pattern);
+                written += pattern.len;
+            }
+            return written;
         }
 
-        self.offset += @intCast(data.len);
+        fn blobWrite(self: *Self, bytes: []const u8) std.Io.Writer.Error!void {
+            if (bytes.len == 0) return;
+            const result = c.sqlite3_blob_write(self.handle, bytes.ptr, @intCast(bytes.len), self.offset);
+            if (result != c.SQLITE_OK) return error.WriteFailed;
+            self.offset += @intCast(bytes.len);
+        }
+    };
 
-        return data.len;
+    /// writer returns a BlobWriter exposing a std.Io.Writer via its `interface` field.
+    pub fn writer(self: *Self) BlobWriter {
+        return .{
+            .blob = self,
+            .interface = .{
+                .vtable = &.{ .drain = BlobWriter.drain },
+                .buffer = &.{},
+                .end = 0,
+            },
+        };
     }
 
     /// Reset the offset used for reading and writing.
@@ -571,7 +611,7 @@ pub const Db = struct {
 
     /// openBlob opens a blob for incremental i/o.
     ///
-    /// Incremental i/o enables writing and reading data using a std.io.Writer and std.io.Reader:
+    /// Incremental i/o enables writing and reading data using a std.Io.Writer and std.Io.Reader:
     ///  * the writer type wraps sqlite3_blob_write, see https://sqlite.org/c3ref/blob_write.html
     ///  * the reader type wraps sqlite3_blob_read, see https://sqlite.org/c3ref/blob_read.html
     ///
@@ -579,19 +619,19 @@ pub const Db = struct {
     /// * the blob must exist before writing; you must use INSERT to create one first (either with data or using a placeholder with ZeroBlob).
     /// * the blob is not extensible, if you want to change the blob size you must use an UPDATE statement.
     ///
-    /// You can get a std.io.Writer to write data to the blob:
+    /// You can get a std.Io.Writer to write data to the blob:
     ///
     ///     var blob = try db.openBlob(.main, "mytable", "mycolumn", 1, .{ .write = true });
     ///     var blob_writer = blob.writer();
     ///
-    ///     try blob_writer.writeAll(my_data);
+    ///     try blob_writer.interface.writeAll(my_data);
     ///
-    /// You can get a std.io.Reader to read the blob data:
+    /// You can get a std.Io.Reader to read the blob data:
     ///
     ///     var blob = try db.openBlob(.main, "mytable", "mycolumn", 1, .{});
     ///     var blob_reader = blob.reader();
     ///
-    ///     const data = try blob_reader.readAlloc(allocator);
+    ///     const data = try blob_reader.interface.allocRemaining(allocator, .unlimited);
     ///
     /// See https://sqlite.org/c3ref/blob_open.html for more details on incremental i/o.
     ///
@@ -1967,7 +2007,7 @@ pub const DynamicStatement = struct {
     pub fn all(self: *Self, comptime Type: type, allocator: mem.Allocator, options: QueryOptions, values: anytype) ![]Type {
         var iter = try self.iteratorAlloc(Type, allocator, values);
 
-        var rows: std.ArrayList(Type) = .{};
+        var rows: std.ArrayList(Type) = .empty;
         while (try iter.nextAlloc(allocator, options)) |row| {
             try rows.append(allocator, row);
         }
@@ -2257,7 +2297,7 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: anytype) type 
         pub fn all(self: *Self, comptime Type: type, allocator: mem.Allocator, options: QueryOptions, values: anytype) ![]Type {
             var iter = try self.iteratorAlloc(Type, allocator, values);
 
-            var rows: std.ArrayList(Type) = .{};
+            var rows: std.ArrayList(Type) = .empty;
             while (try iter.nextAlloc(allocator, options)) |row| {
                 try rows.append(allocator, row);
             }
@@ -3020,7 +3060,7 @@ test "sqlite: statement iterator" {
     var stmt = try db.prepare("INSERT INTO user(name, id, age, weight, favorite_color) VALUES(?{[]const u8}, ?{usize}, ?{usize}, ?{f32}, ?{[]const u8})");
     defer stmt.deinit();
 
-    var expected_rows: std.ArrayList(TestUser) = .{};
+    var expected_rows: std.ArrayList(TestUser) = .empty;
     var i: usize = 0;
     while (i < 20) : (i += 1) {
         const name = try std.fmt.allocPrint(allocator, "Vincent {d}", .{i});
@@ -3047,7 +3087,7 @@ test "sqlite: statement iterator" {
 
         var iter = try stmt2.iterator(RowType, .{});
 
-        var rows: std.ArrayList(RowType) = .{};
+        var rows: std.ArrayList(RowType) = .empty;
         while (try iter.next(.{})) |row| {
             try rows.append(allocator, row);
         }
@@ -3074,7 +3114,7 @@ test "sqlite: statement iterator" {
 
         var iter = try stmt2.iterator(RowType, .{});
 
-        var rows: std.ArrayList(RowType) = .{};
+        var rows: std.ArrayList(RowType) = .empty;
         while (try iter.nextAlloc(allocator, .{})) |row| {
             try rows.append(allocator, row);
         }
@@ -3121,13 +3161,13 @@ test "sqlite: blob open, reopen" {
     {
         // Write the first blob data
         var blob_writer = blob.writer();
-        try blob_writer.writeAll(blob_data1);
-        try blob_writer.writeAll(blob_data1);
+        try blob_writer.interface.writeAll(blob_data1);
+        try blob_writer.interface.writeAll(blob_data1);
 
         blob.reset();
 
         var blob_reader = blob.reader();
-        const data = try blob_reader.readAllAlloc(allocator, 8192);
+        const data = try blob_reader.interface.allocRemaining(allocator, .limited(8192));
 
         try testing.expectEqualSlices(u8, blob_data1 ** 2, data);
     }
@@ -3138,13 +3178,13 @@ test "sqlite: blob open, reopen" {
     {
         // Write the second blob data
         var blob_writer = blob.writer();
-        try blob_writer.writeAll(blob_data2);
-        try blob_writer.writeAll(blob_data2);
+        try blob_writer.interface.writeAll(blob_data2);
+        try blob_writer.interface.writeAll(blob_data2);
 
         blob.reset();
 
         var blob_reader = blob.reader();
-        const data = try blob_reader.readAllAlloc(allocator, 8192);
+        const data = try blob_reader.interface.allocRemaining(allocator, .limited(8192));
 
         try testing.expectEqualSlices(u8, blob_data2 ** 2, data);
     }
@@ -3459,7 +3499,7 @@ test "sqlite: bind runtime slice" {
     const allocator = arena.allocator();
 
     // creating array list on heap so that it's deemed runtime size
-    var list: std.ArrayList([]const u8) = .{};
+    var list: std.ArrayList([]const u8) = .empty;
     defer list.deinit(allocator);
     try list.append(allocator, "this is some data");
     const args = try list.toOwnedSlice(allocator);
@@ -3749,7 +3789,7 @@ test "sqlite: create aggregate function with no aggregate context" {
     var db = try getTestDb();
     defer db.deinit();
 
-    var rand = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+    var rand = std.Random.DefaultPrng.init(std.testing.random_seed);
 
     // Create an aggregate function working with a MyContext
 
@@ -3810,7 +3850,7 @@ test "sqlite: create aggregate function with an aggregate context" {
     var db = try getTestDb();
     defer db.deinit();
 
-    var rand = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+    var rand = std.Random.DefaultPrng.init(std.testing.random_seed);
 
     try db.createAggregateFunction(
         "mySum",
@@ -3877,7 +3917,7 @@ test "sqlite: empty slice" {
     defer db.deinit();
     try addTestData(&db);
 
-    var list: std.ArrayList(u8) = .{};
+    var list: std.ArrayList(u8) = .empty;
     const ptr = try list.toOwnedSlice(allocator);
 
     try db.exec("INSERT INTO article(author_id, data) VALUES(?, ?)", .{}, .{ 1, ptr });
@@ -4054,7 +4094,9 @@ test "reuse same field twice in query string" {
 
 test "fuzzing" {
     const Context = struct {
-        fn testOne(_: @This(), input: []const u8) anyerror!void {
+        fn testOne(_: @This(), smith: *std.testing.Smith) anyerror!void {
+            var input_buf: [4096]u8 = undefined;
+            const input: []const u8 = input_buf[0..smith.slice(&input_buf)];
             var db = try Db.init(.{
                 .mode = .Memory,
                 .open_flags = .{

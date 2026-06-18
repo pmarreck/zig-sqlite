@@ -1072,15 +1072,13 @@ const TestVirtualTable = struct {
         _ = self;
         _ = diags;
 
-        var id_str_writer = builder.id_str_buffer.writer(builder.allocator);
-
         var argv_index: i32 = 0;
         for (builder.constraints) |*constraint| {
             if (constraint.op == .eq) {
                 argv_index += 1;
                 constraint.usage.argv_index = argv_index;
 
-                try id_str_writer.print("={d:<6}", .{constraint.column});
+                try builder.id_str_buffer.print(builder.allocator, "={d:<6}", .{constraint.column});
             }
         }
 
@@ -1176,7 +1174,7 @@ const TestVirtualTableCursor = struct {
             // 3 chars for the '=' marker
             // 6 chars because we format all columns in a 6 char wide string
             const col_str = id[pos + 1 .. pos + 1 + 6];
-            const col = try fmt.parseInt(i32, mem.trimRight(u8, col_str, " "), 10);
+            const col = try fmt.parseInt(i32, mem.trimEnd(u8, col_str, " "), 10);
 
             id = id[pos + 1 + 6 ..];
 
