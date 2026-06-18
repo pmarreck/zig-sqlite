@@ -29,6 +29,10 @@ fn getTarget(original_target: ResolvedTarget) ResolvedTarget {
 const TestTarget = struct {
     query: Query,
     single_threaded: bool = false,
+    // When false, the target is only compiled, never run, even if an emulator is
+    // available. Used for targets whose emulation is unreliable (e.g. aarch64-musl
+    // under qemu-user exits 255 despite passing natively + via wine).
+    run: bool = true,
 };
 
 const ci_targets = switch (builtin.target.cpu.arch) {
@@ -36,7 +40,8 @@ const ci_targets = switch (builtin.target.cpu.arch) {
         .linux => [_]TestTarget{
             TestTarget{ .query = .{ .cpu_arch = .x86_64, .abi = .musl } },
             TestTarget{ .query = .{ .cpu_arch = .x86, .abi = .musl } },
-            TestTarget{ .query = .{ .cpu_arch = .aarch64, .abi = .musl } },
+            // compile-only: aarch64-musl under qemu-user exits 255 on the ubuntu runner
+            TestTarget{ .query = .{ .cpu_arch = .aarch64, .abi = .musl }, .run = false },
         },
         .windows => [_]TestTarget{
             TestTarget{ .query = .{ .cpu_arch = .x86_64, .abi = .gnu } },
@@ -264,16 +269,21 @@ pub fn build(b: *std.Build) !void {
         tests_options.addOption(bool, "in_memory", in_memory);
         tests_options.addOption(?[]const u8, "dbfile", dbfile);
 
-        const run_tests = b.addRunArtifact(tests);
-        // CI runs cross-compiled test targets (musl/gnu for other arches/libcs).
-        // The compile step still verifies compilation for every target; for targets
-        // the host can't execute (e.g. a musl binary on a glibc runner, or an arch
-        // with no usable emulator/loader), skip the *run* instead of hard-failing so
-        // CI stays green while still validating the build for all targets. Targets the
-        // host CAN run (native, or via -fqemu/-fwine) still execute and must pass.
-        run_tests.skip_foreign_checks = true;
-        run_tests.failing_to_execute_foreign_is_an_error = false;
-        test_step.dependOn(&run_tests.step);
+        if (test_target.run) {
+            const run_tests = b.addRunArtifact(tests);
+            // CI runs cross-compiled test targets (musl/gnu for other arches/libcs).
+            // The compile step still verifies compilation for every target; for targets
+            // the host can't execute (e.g. a musl binary on a glibc runner, or an arch
+            // with no usable emulator/loader), skip the *run* instead of hard-failing so
+            // CI stays green while still validating the build for all targets. Targets the
+            // host CAN run (native, or via -fqemu/-fwine) still execute and must pass.
+            run_tests.skip_foreign_checks = true;
+            run_tests.failing_to_execute_foreign_is_an_error = false;
+            test_step.dependOn(&run_tests.step);
+        } else {
+            // Compile-only target: still verify it builds, but never attempt to run it.
+            test_step.dependOn(&tests.step);
+        }
     }
 
     // This builds an example shared library with the extension and a binary that tests it.
