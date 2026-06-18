@@ -48,6 +48,17 @@ const ci_targets = switch (builtin.target.cpu.arch) {
         },
         else => [_]TestTarget{},
     },
+    // aarch64 hosts (e.g. the macos-latest CI runner) run the native target so
+    // the macOS CI leg actually executes the suite instead of being vacuously green.
+    .aarch64 => switch (builtin.target.os.tag) {
+        .macos => [_]TestTarget{
+            TestTarget{ .query = .{ .cpu_arch = .aarch64, .os_tag = .macos } },
+        },
+        .linux => [_]TestTarget{
+            TestTarget{ .query = .{ .cpu_arch = .aarch64, .abi = .musl } },
+        },
+        else => [_]TestTarget{},
+    },
     else => [_]TestTarget{},
 };
 
@@ -254,6 +265,14 @@ pub fn build(b: *std.Build) !void {
         tests_options.addOption(?[]const u8, "dbfile", dbfile);
 
         const run_tests = b.addRunArtifact(tests);
+        // CI runs cross-compiled test targets (musl/gnu for other arches/libcs).
+        // The compile step still verifies compilation for every target; for targets
+        // the host can't execute (e.g. a musl binary on a glibc runner, or an arch
+        // with no usable emulator/loader), skip the *run* instead of hard-failing so
+        // CI stays green while still validating the build for all targets. Targets the
+        // host CAN run (native, or via -fqemu/-fwine) still execute and must pass.
+        run_tests.skip_foreign_checks = true;
+        run_tests.failing_to_execute_foreign_is_an_error = false;
         test_step.dependOn(&run_tests.step);
     }
 
