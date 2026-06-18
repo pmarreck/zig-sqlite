@@ -46,13 +46,16 @@ jobs:
           sudo apt-get update -y && sudo apt-get install -y qemu-user-binfmt
 
       # setup-zig points ZIG_GLOBAL_CACHE_DIR/ZIG_LOCAL_CACHE_DIR at
-      # $GITHUB_WORKSPACE/.zig-cache but, on a cache miss, leaves that
-      # directory uncreated. Zig's .zip dependency fetch then fails with
-      # "failed to create temporary zip file: FileNotFound" because the
-      # cache dir (and its tmp subdir) do not exist. Pre-create it here.
-      - name: Ensure Zig cache dir exists
+      # $GITHUB_WORKSPACE/.zig-cache. Zig 0.16's .zip-dependency fetch
+      # writes its temporary download into <cache>/tmp/ but does NOT
+      # create that subdir itself, so on a fresh (cache-miss) runner the
+      # fetch dies with "failed to create temporary zip file: FileNotFound".
+      # Pre-create <cache>/tmp so the zip fetch has somewhere to write.
+      # (Verified locally: forcing this cache dir reproduces the failure;
+      # creating the tmp/ subdir makes `zig build test` succeed.)
+      - name: Ensure Zig cache tmp dir exists
         shell: bash
-        run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$GITHUB_WORKSPACE/.zig-cache}"
+        run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$GITHUB_WORKSPACE/.zig-cache}/tmp"
 
       - name: Run Tests in memory
         if: ${{ matrix.os == 'ubuntu-24.04' }}
