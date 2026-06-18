@@ -9,3 +9,6 @@ core.*
 
 # OS junk
 .DS_Store
+
+# stray zig fetch/global-cache extraction dir
+/zig-pkg

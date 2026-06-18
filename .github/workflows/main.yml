@@ -45,14 +45,14 @@ jobs:
         run: |
           sudo apt-get update -y && sudo apt-get install -y qemu-user-binfmt
 
-      - name: Restore cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            zig-cache
-            ~/.cache/zig
-          key: ${{ runner.os }}-${{ matrix.os }}-zig-${{ github.sha }}
-          restore-keys: ${{ runner.os }}-${{ matrix.os }}-zig-
+      # setup-zig points ZIG_GLOBAL_CACHE_DIR/ZIG_LOCAL_CACHE_DIR at
+      # $GITHUB_WORKSPACE/.zig-cache but, on a cache miss, leaves that
+      # directory uncreated. Zig's .zip dependency fetch then fails with
+      # "failed to create temporary zip file: FileNotFound" because the
+      # cache dir (and its tmp subdir) do not exist. Pre-create it here.
+      - name: Ensure Zig cache dir exists
+        shell: bash
+        run: mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$GITHUB_WORKSPACE/.zig-cache}"
 
       - name: Run Tests in memory
         if: ${{ matrix.os == 'ubuntu-24.04' }}
